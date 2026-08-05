@@ -32,6 +32,7 @@ from .util._types import MaybeAwaitable
 
 if TYPE_CHECKING:
     from .agent import Agent
+    from .extensions.agent_hooks import AgentHooksConfig
     from .run_context import RunContextWrapper
     from .sandbox.manifest import Manifest
     from .sandbox.session.base_sandbox_session import BaseSandboxSession
@@ -429,6 +430,9 @@ class RunConfig:
       the run continue.
     """
 
+    agent_hooks: AgentHooksConfig | None = None
+    """Optional Agent Hooks configuration for this run."""
+
     if TYPE_CHECKING:
 
         def __init__(
@@ -456,6 +460,7 @@ class RunConfig:
             sandbox: SandboxRunConfig | dict[str, Any] | None = None,
             tool_execution: ToolExecutionConfig | dict[str, Any] | None = None,
             tool_not_found_behavior: ToolNotFoundBehavior = "raise_error",
+            agent_hooks: AgentHooksConfig | dict[str, object] | None = None,
         ) -> None: ...
 
     def __post_init__(self) -> None:
@@ -485,6 +490,18 @@ class RunConfig:
                     ToolExecutionConfig,
                 ),
                 parameter_name="run_config.tool_execution",
+            )
+        if self.agent_hooks is not None:
+            from .extensions.agent_hooks import AgentHooksConfig
+
+            self.agent_hooks = coerce_dataclass_config(
+                self.agent_hooks,
+                _declared_dataclass_type(
+                    type(self),
+                    "agent_hooks",
+                    AgentHooksConfig,
+                ),
+                parameter_name="run_config.agent_hooks",
             )
 
 

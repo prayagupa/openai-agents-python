@@ -6,6 +6,7 @@ approvals, and turn processing; all symbols here are internal and not part of th
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses as _dc
 import json
 from collections.abc import Awaitable, Callable, Mapping
@@ -71,6 +72,7 @@ from ..models._response_terminal import (
 )
 from ..models._run_context import model_run_context, model_run_context_stream
 from ..result import RunResultStreaming
+from ..retry import ModelRetrySettings
 from ..run_config import ReasoningItemIdPolicy, RunConfig
 from ..run_context import AgentHookContext, RunContextWrapper, TContext
 from ..run_error_handlers import RunErrorHandlers
@@ -97,6 +99,15 @@ from ..tracing.span_data import AgentSpanData, TaskSpanData
 from ..usage import Usage, _response_usage_to_usage
 from ..util import _coro, _error_tracing
 from .agent_bindings import AgentBindings, bind_public_agent
+from .agent_hooks import (
+    clear_agent_hooks_error_graph,
+    get_current_agent_hooks_session,
+    sanitize_agent_hooks_application_error,
+)
+from .agent_hooks_profile import (
+    snapshot_agent_hooks_model_settings,
+    snapshot_agent_hooks_model_tools,
+)
 from .agent_runner_helpers import (
     apply_resumed_conversation_settings,
     attach_usage_to_span,
@@ -1926,22 +1937,58 @@ async def get_new_response(
     model_settings = get_model_settings(execution_agent, run_config)
     model_settings = maybe_reset_tool_choice(public_agent, tool_use_tracker, model_settings)
 
+    agent_hooks_session = get_current_agent_hooks_session()
+    model_call = None
+    if agent_hooks_session is not None:
+        model_call = agent_hooks_session.new_model_call(model)
+        filtered.instructions, filtered.input = await agent_hooks_session.emit_pre_model(
+            call=model_call,
+            instructions=filtered.instructions,
+            input_items=filtered.input,
+        )
+
+    async def record_model_failure(error: BaseException) -> None:
+        if agent_hooks_session is None or model_call is None:
+            return
+        try:
+            await agent_hooks_session.emit_post_model_failure(
+                call=model_call,
+                cancelled=isinstance(error, asyncio.CancelledError),
+            )
+        except BaseException as governance_error:
+            raise error.with_traceback(error.__traceback__) from governance_error
+
     if server_conversation_tracker is not None:
         server_conversation_tracker.mark_input_as_sent(filtered.input)
 
-    await asyncio.gather(
-        hooks.on_llm_start(context_wrapper, public_agent, filtered.instructions, filtered.input),
-        (
-            public_agent.hooks.on_llm_start(
+    run_hook_input = (
+        copy.deepcopy(filtered.input) if agent_hooks_session is not None else filtered.input
+    )
+    agent_hook_input = (
+        copy.deepcopy(filtered.input) if agent_hooks_session is not None else filtered.input
+    )
+    try:
+        await asyncio.gather(
+            hooks.on_llm_start(
                 context_wrapper,
                 public_agent,
                 filtered.instructions,
-                filtered.input,
-            )
-            if public_agent.hooks
-            else _coro.noop_coroutine()
-        ),
-    )
+                run_hook_input,
+            ),
+            (
+                public_agent.hooks.on_llm_start(
+                    context_wrapper,
+                    public_agent,
+                    filtered.instructions,
+                    agent_hook_input,
+                )
+                if public_agent.hooks
+                else _coro.noop_coroutine()
+            ),
+        )
+    except BaseException as model_error:
+        await record_model_failure(model_error)
+        raise
 
     previous_response_id = (
         server_conversation_tracker.previous_response_id
@@ -1976,46 +2023,105 @@ async def get_new_response(
             await rewind_session_items(session, items_to_rewind, server_conversation_tracker)
             server_conversation_tracker.rewind_input(filtered.input)
 
-    with model_run_context(tool_use_tracker):
-        new_response = await get_response_with_retry(
-            get_response=lambda: model.get_response(
-                system_instructions=filtered.instructions,
-                input=filtered.input,
-                model_settings=model_settings,
-                tools=all_tools,
-                output_schema=output_schema,
-                handoffs=handoffs,
-                tracing=get_model_tracing_impl(
-                    run_config.tracing_disabled, run_config.trace_include_sensitive_data
+    dispatch_tools = (
+        snapshot_agent_hooks_model_tools(all_tools)
+        if agent_hooks_session is not None
+        else all_tools
+    )
+    dispatch_model_settings = (
+        snapshot_agent_hooks_model_settings(model_settings)
+        if agent_hooks_session is not None
+        else model_settings
+    )
+    host_retry_settings = (
+        ModelRetrySettings(max_retries=0)
+        if agent_hooks_session is not None
+        else model_settings.retry
+    )
+
+    async def dispatch_model_response() -> ModelResponse:
+        with model_run_context(tool_use_tracker):
+            return await get_response_with_retry(
+                get_response=lambda: model.get_response(
+                    system_instructions=filtered.instructions,
+                    input=filtered.input,
+                    model_settings=(
+                        snapshot_agent_hooks_model_settings(dispatch_model_settings)
+                        if agent_hooks_session is not None
+                        else dispatch_model_settings
+                    ),
+                    tools=dispatch_tools,
+                    output_schema=output_schema,
+                    handoffs=handoffs,
+                    tracing=get_model_tracing_impl(
+                        run_config.tracing_disabled, run_config.trace_include_sensitive_data
+                    ),
+                    previous_response_id=previous_response_id,
+                    conversation_id=conversation_id,
+                    prompt=prompt_config,
                 ),
+                rewind=rewind_model_request,
+                retry_settings=host_retry_settings,
+                get_retry_advice=model.get_retry_advice,
                 previous_response_id=previous_response_id,
                 conversation_id=conversation_id,
-                prompt=prompt_config,
-            ),
-            rewind=rewind_model_request,
-            retry_settings=model_settings.retry,
-            get_retry_advice=model.get_retry_advice,
-            previous_response_id=previous_response_id,
-            conversation_id=conversation_id,
-            replay_unsafe_request=any(
-                isinstance(tool, ProgrammaticToolCallingTool) for tool in all_tools
-            ),
-        )
+                replay_unsafe_request=any(
+                    isinstance(tool, ProgrammaticToolCallingTool) for tool in all_tools
+                ),
+            )
+
+    if agent_hooks_session is None:
+        new_response = await dispatch_model_response()
+    else:
+        model_task = asyncio.create_task(dispatch_model_response())
+        model_failure: BaseException | None = None
+        try:
+            new_response = await asyncio.shield(model_task)
+        except asyncio.CancelledError as parent_cancellation:
+            if not model_task.done():
+                model_task.cancel()
+            await asyncio.gather(model_task, return_exceptions=True)
+            model_failure = sanitize_agent_hooks_application_error(parent_cancellation)
+            clear_agent_hooks_error_graph(parent_cancellation)
+        except BaseException as model_error:
+            model_failure = sanitize_agent_hooks_application_error(model_error)
+            clear_agent_hooks_error_graph(model_error)
+        if model_failure is not None:
+            await record_model_failure(model_failure)
+            raise model_failure
     if server_conversation_tracker is not None:
         # Retry helpers rewind sent-input tracking before replaying a failed request. Mark the
         # filtered input as delivered again once a retry succeeds so subsequent turns only send
         # new deltas.
         server_conversation_tracker.mark_input_as_sent(filtered.input)
 
-    context_wrapper.usage.add(new_response.usage)
+    if agent_hooks_session is not None:
+        assert model_call is not None
+        validated_usage = await agent_hooks_session.prepare_model_usage(
+            call=model_call,
+            response=new_response,
+        )
+        context_wrapper.usage.add(validated_usage)
+        new_response = await agent_hooks_session.emit_post_model(
+            call=model_call,
+            response=new_response,
+        )
+    else:
+        context_wrapper.usage.add(new_response.usage)
 
+    run_hook_response = (
+        copy.deepcopy(new_response) if agent_hooks_session is not None else new_response
+    )
+    agent_hook_response = (
+        copy.deepcopy(new_response) if agent_hooks_session is not None else new_response
+    )
     await asyncio.gather(
         (
-            public_agent.hooks.on_llm_end(context_wrapper, public_agent, new_response)
+            public_agent.hooks.on_llm_end(context_wrapper, public_agent, agent_hook_response)
             if public_agent.hooks
             else _coro.noop_coroutine()
         ),
-        hooks.on_llm_end(context_wrapper, public_agent, new_response),
+        hooks.on_llm_end(context_wrapper, public_agent, run_hook_response),
     )
 
     return new_response

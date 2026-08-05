@@ -100,6 +100,7 @@ from ..tracing import SpanError, handoff_span
 from ..util import _coro, _error_tracing
 from ..util._approvals import evaluate_needs_approval_setting
 from .agent_bindings import AgentBindings
+from .agent_hooks import get_current_agent_hooks_session
 from .error_handlers import (
     build_run_error_data,
     create_message_output_item,
@@ -337,6 +338,10 @@ async def execute_final_output_step(
     | None = None,
 ) -> SingleStepResult:
     """Finalize a turn once final output is known and run end hooks."""
+    agent_hooks_session = get_current_agent_hooks_session()
+    if agent_hooks_session is not None:
+        final_output = await agent_hooks_session.emit_output(final_output)
+
     final_output_hooks = run_final_output_hooks_fn or run_final_output_hooks
     await final_output_hooks(public_agent, hooks, context_wrapper, final_output)
 

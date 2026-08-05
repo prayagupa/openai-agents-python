@@ -1841,6 +1841,14 @@ def resolve_function_tool_failure_error_function(
     return function_tool._failure_error_function
 
 
+def function_tool_has_custom_error_formatter(function_tool: FunctionTool) -> bool:
+    """Return whether a tool can invoke a caller-provided failure or timeout formatter."""
+    return function_tool.timeout_error_function is not None or (
+        not function_tool._use_default_failure_error_function
+        and function_tool._failure_error_function is not None
+    )
+
+
 _DEFAULT_FAILURE_HANDLED_ATTR = "_function_tool_default_failure_handled"
 
 
@@ -2698,6 +2706,16 @@ def _validate_function_tool_timeout_config(tool: FunctionTool) -> None:
 
     if tool.timeout_error_function is not None and not callable(tool.timeout_error_function):
         raise TypeError("FunctionTool timeout_error_function must be callable or None.")
+
+
+def is_async_function_tool(tool: FunctionTool) -> bool:
+    """Return whether a function tool handler remains cancellation-cooperative."""
+    callback = tool.on_invoke_tool
+    if getattr(callback, _SYNC_FUNCTION_TOOL_MARKER, False):
+        return False
+    return inspect.iscoroutinefunction(callback) or inspect.iscoroutinefunction(
+        inspect.getattr_static(type(callback), "__call__", None)
+    )
 
 
 def _store_computer_initializer(tool: ComputerTool[Any]) -> None:
