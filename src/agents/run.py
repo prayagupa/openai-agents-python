@@ -47,6 +47,20 @@ from .run_config import (
 from .run_context import RunContextWrapper, TContext
 from .run_error_handlers import RunErrorHandlers
 from .run_internal.agent_bindings import bind_public_agent
+from .run_internal.agent_hooks import (
+    bind_agent_hooks_session,
+    clear_agent_hooks_error_graph,
+    create_agent_hooks_session,
+    get_current_agent_hooks_session,
+    is_agent_hooks_control_error,
+    reset_agent_hooks_session,
+    sanitize_agent_hooks_control_error,
+    sanitize_agent_hooks_setup_error,
+)
+from .run_internal.agent_hooks_profile import (
+    snapshot_agent_hooks_run,
+    validate_agent_hooks_profile,
+)
 from .run_internal.agent_runner_helpers import (
     append_model_response_if_new,
     apply_resumed_conversation_settings,
@@ -199,6 +213,14 @@ def _sandbox_memory_input(
     return copy_input_items(original_input)
 
 
+def _has_agent_hooks_config(run_config: object) -> bool:
+    if isinstance(run_config, RunConfig):
+        return object.__getattribute__(run_config, "agent_hooks") is not None
+    if isinstance(run_config, dict):
+        return dict.get(run_config, "agent_hooks") is not None
+    return False
+
+
 class Runner:
     @classmethod
     async def run(
@@ -270,19 +292,46 @@ class Runner:
         """
 
         runner = DEFAULT_AGENT_RUNNER
-        return await runner.run(
-            starting_agent,
-            input,
-            context=context,
-            max_turns=max_turns,
-            hooks=hooks,
-            run_config=run_config,
-            error_handlers=error_handlers,
-            previous_response_id=previous_response_id,
-            auto_previous_response_id=auto_previous_response_id,
-            conversation_id=conversation_id,
-            session=session,
-        )
+        agent_hooks_configured = _has_agent_hooks_config(run_config)
+        clean_error: BaseException | None = None
+        clean_cause: BaseException | None = None
+        try:
+            return await runner.run(
+                starting_agent,
+                input,
+                context=context,
+                max_turns=max_turns,
+                hooks=hooks,
+                run_config=run_config,
+                error_handlers=error_handlers,
+                previous_response_id=previous_response_id,
+                auto_previous_response_id=auto_previous_response_id,
+                conversation_id=conversation_id,
+                session=session,
+            )
+        except BaseException as error:
+            if not agent_hooks_configured or not is_agent_hooks_control_error(error):
+                raise
+            clean_error = sanitize_agent_hooks_control_error(error)
+            clean_cause = (
+                sanitize_agent_hooks_control_error(error.__cause__)
+                if error.__cause__ is not None and is_agent_hooks_control_error(error.__cause__)
+                else None
+            )
+            starting_agent = cast(Agent[TContext], None)
+            input = ""
+            context = None
+            hooks = None
+            run_config = None
+            error_handlers = None
+            previous_response_id = None
+            auto_previous_response_id = False
+            conversation_id = None
+            session = None
+            runner = cast(AgentRunner, None)
+            error = cast(BaseException, None)
+        assert clean_error is not None
+        raise clean_error from clean_cause
 
     @classmethod
     def run_sync(
@@ -352,19 +401,46 @@ class Runner:
         """
 
         runner = DEFAULT_AGENT_RUNNER
-        return runner.run_sync(
-            starting_agent,
-            input,
-            context=context,
-            max_turns=max_turns,
-            hooks=hooks,
-            run_config=run_config,
-            error_handlers=error_handlers,
-            previous_response_id=previous_response_id,
-            conversation_id=conversation_id,
-            session=session,
-            auto_previous_response_id=auto_previous_response_id,
-        )
+        agent_hooks_configured = _has_agent_hooks_config(run_config)
+        clean_error: BaseException | None = None
+        clean_cause: BaseException | None = None
+        try:
+            return runner.run_sync(
+                starting_agent,
+                input,
+                context=context,
+                max_turns=max_turns,
+                hooks=hooks,
+                run_config=run_config,
+                error_handlers=error_handlers,
+                previous_response_id=previous_response_id,
+                conversation_id=conversation_id,
+                session=session,
+                auto_previous_response_id=auto_previous_response_id,
+            )
+        except BaseException as error:
+            if not agent_hooks_configured or not is_agent_hooks_control_error(error):
+                raise
+            clean_error = sanitize_agent_hooks_control_error(error)
+            clean_cause = (
+                sanitize_agent_hooks_control_error(error.__cause__)
+                if error.__cause__ is not None and is_agent_hooks_control_error(error.__cause__)
+                else None
+            )
+            starting_agent = cast(Agent[TContext], None)
+            input = ""
+            context = None
+            hooks = None
+            run_config = None
+            error_handlers = None
+            previous_response_id = None
+            auto_previous_response_id = False
+            conversation_id = None
+            session = None
+            runner = cast(AgentRunner, None)
+            error = cast(BaseException, None)
+        assert clean_error is not None
+        raise clean_error from clean_cause
 
     @classmethod
     def run_streamed(
@@ -453,6 +529,154 @@ class AgentRunner:
     """
 
     async def run(
+        self,
+        starting_agent: Agent[TContext],
+        input: str | list[TResponseInputItem] | RunState[TContext],
+        **kwargs: Unpack[RunOptions[TContext]],
+    ) -> RunResult:
+        raw_run_config = kwargs.get("run_config")
+        agent_hooks_configured = _has_agent_hooks_config(raw_run_config)
+        if not agent_hooks_configured:
+            token = bind_agent_hooks_session(None)
+            try:
+                return await self._run_impl(starting_agent, input, **kwargs)
+            finally:
+                reset_agent_hooks_session(token)
+
+        max_turns = kwargs.get("max_turns", DEFAULT_MAX_TURNS)
+        setup_error: BaseException | None = None
+        run_config = cast(RunConfig, None)
+        agent_hooks: Any = None
+        snapshot_agent = cast(Agent[TContext], None)
+        snapshot_config = cast(RunConfig, None)
+        snapshot_agent_hooks: Any = None
+        session: Any = None
+        try:
+            if raw_run_config is None:
+                raise RuntimeError("Agent Hooks configuration was not provided")
+            run_config = _coerce_run_config(raw_run_config)
+            agent_hooks = run_config.agent_hooks
+            if agent_hooks is None:
+                raise RuntimeError("Agent Hooks configuration was lost during validation")
+            validate_agent_hooks_profile(
+                starting_agent=starting_agent,
+                input=input,
+                max_turns=max_turns,
+                run_config=run_config,
+                error_handlers=kwargs.get("error_handlers"),
+                previous_response_id=kwargs.get("previous_response_id"),
+                auto_previous_response_id=kwargs.get("auto_previous_response_id", False),
+                conversation_id=kwargs.get("conversation_id"),
+                session=kwargs.get("session"),
+                context=kwargs.get("context"),
+                run_hooks=kwargs.get("hooks"),
+            )
+            snapshot_agent, snapshot_config = snapshot_agent_hooks_run(
+                starting_agent=starting_agent,
+                run_config=run_config,
+            )
+            snapshot_agent_hooks = snapshot_config.agent_hooks
+            if snapshot_agent_hooks is None:
+                raise RuntimeError("Agent Hooks configuration was lost during snapshotting")
+            session = create_agent_hooks_session(
+                config=snapshot_agent_hooks,
+                starting_agent=snapshot_agent,
+                max_turns=cast(int, max_turns),
+            )
+        except BaseException as error:
+            setup_error = sanitize_agent_hooks_setup_error(error)
+            clear_agent_hooks_error_graph(error)
+            self = cast(AgentRunner, None)
+            starting_agent = cast(Agent[TContext], None)
+            input = ""
+            kwargs = cast(RunOptions[TContext], {})
+            raw_run_config = None
+            run_config = cast(RunConfig, None)
+            agent_hooks = None
+            snapshot_agent = cast(Agent[TContext], None)
+            snapshot_config = cast(RunConfig, None)
+            snapshot_agent_hooks = None
+            session = None
+            max_turns = 0
+            error = cast(BaseException, None)
+        if setup_error is not None:
+            raise setup_error from None
+
+        token = bind_agent_hooks_session(session)
+        raw_primary_error: BaseException | None = None
+        raw_cleanup_error: BaseException | None = None
+        result: RunResult | None = None
+        transformed_input: str | None = None
+        shutdown_reason = "completed"
+        kwargs["run_config"] = snapshot_config
+
+        try:
+            try:
+                await session.open()
+                transformed_input = await session.emit_input(cast(str, input))
+                result = await self._run_impl(snapshot_agent, transformed_input, **kwargs)
+            except BaseException as error:
+                raw_primary_error = error
+                shutdown_reason = (
+                    "cancelled" if isinstance(error, asyncio.CancelledError) else "error"
+                )
+            try:
+                await session.close(shutdown_reason)
+            except BaseException as error:
+                raw_cleanup_error = error
+        finally:
+            try:
+                reset_agent_hooks_session(token)
+            finally:
+                session.release()
+
+        primary_error: BaseException | None = None
+        if raw_primary_error is not None:
+            primary_error = sanitize_agent_hooks_control_error(raw_primary_error)
+            clear_agent_hooks_error_graph(raw_primary_error)
+            input = ""
+            transformed_input = None
+        cleanup_error: BaseException | None = None
+        if raw_cleanup_error is not None:
+            cleanup_error = sanitize_agent_hooks_control_error(raw_cleanup_error)
+            clear_agent_hooks_error_graph(raw_cleanup_error)
+
+        terminal_error = primary_error if primary_error is not None else cleanup_error
+        if terminal_error is not None:
+            clean_error = sanitize_agent_hooks_control_error(terminal_error)
+            cause = cleanup_error if primary_error is not None else None
+            self = cast(AgentRunner, None)
+            starting_agent = cast(Agent[TContext], None)
+            snapshot_agent = cast(Agent[TContext], None)
+            input = ""
+            kwargs = cast(RunOptions[TContext], {})
+            raw_run_config = None
+            run_config = cast(RunConfig, None)
+            agent_hooks = None
+            snapshot_agent_hooks = None
+            snapshot_config = cast(RunConfig, None)
+            max_turns = 0
+            session = cast(Any, None)
+            token = cast(Any, None)
+            raw_primary_error = None
+            raw_cleanup_error = None
+            primary_error = None
+            cleanup_error = None
+            result = None
+            transformed_input = None
+            shutdown_reason = ""
+            terminal_error = cast(BaseException, None)
+            raise clean_error from cause
+        if result is None:
+            raise RuntimeError("Agent Hooks run completed without a result")
+        result._last_agent = starting_agent
+        result._starting_agent_for_state = starting_agent
+        for item in result.new_items:
+            if item.agent is snapshot_agent:
+                item.agent = starting_agent
+        return result
+
+    async def _run_impl(
         self,
         starting_agent: Agent[TContext],
         input: str | list[TResponseInputItem] | RunState[TContext],
@@ -1587,7 +1811,10 @@ class AgentRunner:
                         turn_result.new_step_items.clear()
             except BaseException as exc:
                 run_exception = exc
-                if isinstance(exc, AgentsException):
+                agent_hooks_session = get_current_agent_hooks_session()
+                if isinstance(exc, AgentsException) and (
+                    agent_hooks_session is None or not is_agent_hooks_control_error(exc)
+                ):
                     exc.run_data = RunErrorDetails(
                         input=original_input,
                         new_items=session_items,
@@ -1749,6 +1976,11 @@ class AgentRunner:
         session = kwargs.get("session")
 
         run_config = RunConfig() if run_config is None else _coerce_run_config(run_config)
+
+        if run_config.agent_hooks is not None:
+            raise UserError(
+                "Agent Hooks does not support streaming; use Runner.run() or Runner.run_sync()"
+            )
 
         # Handle RunState input
         is_resumed_state = isinstance(input, RunState)
@@ -1948,27 +2180,31 @@ class AgentRunner:
             sandbox_runtime.apply_result_metadata(streamed_result)
 
         # Kick off the actual agent loop in the background and return the streamed result object.
-        streamed_result.run_loop_task = asyncio.create_task(
-            start_streaming(
-                starting_input=input_for_result,
-                streamed_result=streamed_result,
-                starting_agent=starting_agent,
-                max_turns=max_turns,
-                hooks=hooks,
-                context_wrapper=context_wrapper,
-                run_config=run_config,
-                error_handlers=error_handlers,
-                previous_response_id=previous_response_id,
-                auto_previous_response_id=auto_previous_response_id,
-                conversation_id=conversation_id,
-                session=session,
-                run_state=run_state,
-                is_resumed_state=is_resumed_state,
-                sandbox_runtime=sandbox_runtime,
+        agent_hooks_token = bind_agent_hooks_session(None)
+        try:
+            streamed_result.run_loop_task = asyncio.create_task(
+                start_streaming(
+                    starting_input=input_for_result,
+                    streamed_result=streamed_result,
+                    starting_agent=starting_agent,
+                    max_turns=max_turns,
+                    hooks=hooks,
+                    context_wrapper=context_wrapper,
+                    run_config=run_config,
+                    error_handlers=error_handlers,
+                    previous_response_id=previous_response_id,
+                    auto_previous_response_id=auto_previous_response_id,
+                    conversation_id=conversation_id,
+                    session=session,
+                    run_state=run_state,
+                    is_resumed_state=is_resumed_state,
+                    sandbox_runtime=sandbox_runtime,
+                )
             )
-        )
-        if sandbox_runtime.enabled:
-            streamed_result.ensure_sandbox_cleanup_on_completion()
+            if sandbox_runtime.enabled:
+                streamed_result.ensure_sandbox_cleanup_on_completion()
+        finally:
+            reset_agent_hooks_session(agent_hooks_token)
         return streamed_result
 
 

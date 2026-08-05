@@ -269,10 +269,11 @@ def resolve_trace_settings(
         if metadata is None and trace_state.metadata is not None:
             metadata = dict(trace_state.metadata)
 
-    metadata = add_openai_harness_id_to_metadata(
-        metadata,
-        model_provider=run_config.model_provider,
-    )
+    if not getattr(run_config.model_provider, "_agent_hooks_trace_metadata_resolved", False):
+        metadata = add_openai_harness_id_to_metadata(
+            metadata,
+            model_provider=run_config.model_provider,
+        )
 
     return workflow_name, trace_id, group_id, metadata, tracing
 

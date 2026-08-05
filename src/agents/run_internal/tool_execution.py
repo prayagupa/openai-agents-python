@@ -91,6 +91,7 @@ from ..tool_guardrails import (
     ToolOutputGuardrailResult,
 )
 from ..tracing import Span, SpanError, function_span, get_current_trace
+from ..usage import Usage
 from ..util import _coro, _error_tracing
 from ..util._approvals import evaluate_needs_approval_setting, parse_function_tool_arguments
 from ..util._asyncio_tasks import gather_with_cancel
@@ -99,6 +100,12 @@ from ..util._tool_errors import get_trace_tool_error
 from ..util._types import MaybeAwaitable
 from ._asyncio_progress import get_function_tool_task_progress_deadline
 from .agent_bindings import AgentBindings, bind_public_agent
+from .agent_hooks import (
+    ToolInvocation,
+    clear_agent_hooks_error_graph,
+    get_current_agent_hooks_session,
+    sanitize_agent_hooks_application_error,
+)
 from .approvals import append_approval_error_output
 from .items import (
     REJECTION_MESSAGE,
@@ -1497,7 +1504,7 @@ class _FunctionToolBatchExecutor:
         except asyncio.CancelledError as exc:
             if self.propagating_failure is exc:
                 raise
-            self._cancel_pending_tasks_for_parent_cancellation()
+            await self._cancel_pending_tasks_for_parent_cancellation()
             raise
 
         return (
@@ -1616,11 +1623,23 @@ class _FunctionToolBatchExecutor:
             timeout_seconds=_FUNCTION_TOOL_POST_INVOKE_WAIT_SECONDS,
         )
 
-    def _cancel_pending_tasks_for_parent_cancellation(self) -> None:
-        self.teardown_cancelled_tasks.update(self.pending_tasks)
-        _cancel_function_tool_tasks(self.pending_tasks)
+    async def _cancel_pending_tasks_for_parent_cancellation(self) -> None:
+        pending_tasks = set(self.pending_tasks)
+        self.teardown_cancelled_tasks.update(pending_tasks)
+        _cancel_function_tool_tasks(pending_tasks)
+        if get_current_agent_hooks_session() is not None:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+            invoke_tasks = {
+                state.invoke_task
+                for state in self.task_states.values()
+                if state.invoke_task is not None
+            }
+            if invoke_tasks:
+                await asyncio.gather(*invoke_tasks, return_exceptions=True)
+            self.pending_tasks = set()
+            return
         _attach_function_tool_task_result_callbacks(
-            self.pending_tasks,
+            pending_tasks,
             message_for_exception=_parent_cancelled_task_exception_message,
         )
 
@@ -1639,6 +1658,23 @@ class _FunctionToolBatchExecutor:
             ResponseFunctionToolCall,
             normalize_tool_call_for_function_tool(tool_call, func_tool),
         )
+        agent_hooks_session = get_current_agent_hooks_session()
+        agent_hooks_invocation: ToolInvocation | None = None
+        if agent_hooks_session is not None:
+            pre_decision = await agent_hooks_session.emit_pre_tool(
+                tool=func_tool,
+                tool_call=tool_call,
+            )
+            if pre_decision.blocked_message is not None:
+                return self._agent_hooks_blocked_result(
+                    func_tool=func_tool,
+                    tool_call=tool_call,
+                    blocked_message=pre_decision.blocked_message,
+                )
+            assert pre_decision.invocation is not None
+            agent_hooks_invocation = pre_decision.invocation
+            tool_call = cast(ResponseFunctionToolCall, agent_hooks_invocation.tool_call)
+            raw_tool_call = tool_call
         trace_tool_name = (
             get_tool_call_trace_name(tool_call)
             or get_function_tool_trace_name(func_tool)
@@ -1648,13 +1684,32 @@ class _FunctionToolBatchExecutor:
             tool_context_namespace = get_tool_call_namespace(raw_tool_call)
             if tool_context_namespace is None:
                 tool_context_namespace = get_tool_call_namespace(tool_call)
-            tool_context = ToolContext.from_agent_context(
-                self.context_wrapper,
-                tool_call.call_id,
-                tool_call=raw_tool_call,
-                tool_namespace=tool_context_namespace,
-                agent=self.public_agent,
-                run_config=self.config,
+            context_tool_call = (
+                raw_tool_call.model_copy(deep=True)
+                if agent_hooks_invocation is not None
+                else raw_tool_call
+            )
+            tool_context = (
+                ToolContext(
+                    context=None,
+                    usage=Usage(),
+                    tool_name=tool_call.name,
+                    tool_call_id=tool_call.call_id,
+                    tool_arguments=tool_call.arguments,
+                    tool_call=context_tool_call,
+                    tool_namespace=tool_context_namespace,
+                    agent=None,
+                    run_config=None,
+                )
+                if agent_hooks_invocation is not None
+                else ToolContext.from_agent_context(
+                    self.context_wrapper,
+                    tool_call.call_id,
+                    tool_call=context_tool_call,
+                    tool_namespace=tool_context_namespace,
+                    agent=self.public_agent,
+                    run_config=self.config,
+                )
             )
             agent_hooks = self.public_agent.hooks
             if self.config.trace_include_sensitive_data:
@@ -1677,6 +1732,7 @@ class _FunctionToolBatchExecutor:
                         tool_call=tool_call,
                         tool_context=tool_context,
                         agent_hooks=agent_hooks,
+                        agent_hooks_invocation=agent_hooks_invocation,
                     )
             except Exception as e:
                 trace_error = get_trace_tool_error(
@@ -1691,11 +1747,32 @@ class _FunctionToolBatchExecutor:
                 )
                 if isinstance(e, AgentsException):
                     raise e
+                if agent_hooks_invocation is not None:
+                    raise UserError(f"Error running tool {func_tool.name}") from None
                 raise UserError(f"Error running tool {func_tool.name}: {e}") from e
 
             if self.config.trace_include_sensitive_data:
                 span_fn.span_data.output = result
             return result
+
+    def _agent_hooks_blocked_result(
+        self,
+        *,
+        func_tool: FunctionTool,
+        tool_call: ResponseFunctionToolCall,
+        blocked_message: str,
+    ) -> FunctionToolResult:
+        return FunctionToolResult(
+            tool=func_tool,
+            output=blocked_message,
+            run_item=function_rejection_item(
+                self.public_agent,
+                tool_call,
+                rejection_message=blocked_message,
+                scope_id=self.tool_state_scope_id,
+                tool_origin=get_function_tool_origin(func_tool),
+            ),
+        )
 
     async def _maybe_execute_tool_approval(
         self,
@@ -1817,25 +1894,27 @@ class _FunctionToolBatchExecutor:
         tool_call: ResponseFunctionToolCall,
         tool_context: ToolContext[Any],
         agent_hooks: Any,
+        agent_hooks_invocation: ToolInvocation | None,
     ) -> Any:
-        rejected_message = await _execute_tool_input_guardrails(
-            func_tool=func_tool,
-            tool_context=tool_context,
-            agent=self.public_agent,
-            tool_input_guardrail_results=self.tool_input_guardrail_results,
-        )
-        if rejected_message is not None:
-            self.schema_bypassed_tool_runs.add(id(task_state.tool_run))
-            return rejected_message
+        if agent_hooks_invocation is None:
+            rejected_message = await _execute_tool_input_guardrails(
+                func_tool=func_tool,
+                tool_context=tool_context,
+                agent=self.public_agent,
+                tool_input_guardrail_results=self.tool_input_guardrail_results,
+            )
+            if rejected_message is not None:
+                self.schema_bypassed_tool_runs.add(id(task_state.tool_run))
+                return rejected_message
 
-        await asyncio.gather(
-            self.hooks.on_tool_start(tool_context, self.public_agent, func_tool),
-            (
-                agent_hooks.on_tool_start(tool_context, self.public_agent, func_tool)
-                if agent_hooks
-                else _coro.noop_coroutine()
-            ),
-        )
+            await asyncio.gather(
+                self.hooks.on_tool_start(tool_context, self.public_agent, func_tool),
+                (
+                    agent_hooks.on_tool_start(tool_context, self.public_agent, func_tool)
+                    if agent_hooks
+                    else _coro.noop_coroutine()
+                ),
+            )
 
         invoke_task = asyncio.create_task(
             self._invoke_tool_and_run_post_invoke(
@@ -1845,6 +1924,7 @@ class _FunctionToolBatchExecutor:
                 tool_call=tool_call,
                 tool_context=tool_context,
                 agent_hooks=agent_hooks,
+                agent_hooks_invocation=agent_hooks_invocation,
             )
         )
         task_state.invoke_task = invoke_task
@@ -1865,9 +1945,50 @@ class _FunctionToolBatchExecutor:
         tool_call: ResponseFunctionToolCall,
         tool_context: ToolContext[Any],
         agent_hooks: Any,
+        agent_hooks_invocation: ToolInvocation | None,
     ) -> Any:
         bypass_output_schema = False
+        agent_hooks_session = get_current_agent_hooks_session()
+        invocation_started_at: float | None = None
+
+        async def record_terminal_error(
+            error: BaseException, *, error_type_name: str | None = None
+        ) -> None:
+            if (
+                agent_hooks_session is None
+                or agent_hooks_invocation is None
+                or invocation_started_at is None
+            ):
+                return
+            task_state.in_post_invoke_phase = True
+            try:
+                await agent_hooks_session.emit_post_tool(
+                    invocation=agent_hooks_invocation,
+                    result=f"tool_error:{error_type_name or type(error).__name__}",
+                    is_error=True,
+                    started_at=invocation_started_at,
+                )
+            except BaseException as governance_error:
+                raise error.with_traceback(error.__traceback__) from governance_error
+
         try:
+            if agent_hooks_session is not None and agent_hooks_invocation is not None:
+                tool_call = cast(
+                    ResponseFunctionToolCall,
+                    agent_hooks_session.prepare_tool_invocation(agent_hooks_invocation),
+                )
+                tool_context = ToolContext(
+                    context=None,
+                    usage=Usage(),
+                    tool_name=tool_call.name,
+                    tool_call_id=tool_call.call_id,
+                    tool_arguments=tool_call.arguments,
+                    tool_call=tool_call.model_copy(deep=True),
+                    tool_namespace=get_tool_call_namespace(tool_call),
+                    agent=None,
+                    run_config=None,
+                )
+                invocation_started_at = agent_hooks_session.start_tool_invocation()
             invocation_result = await _invoke_function_tool_with_metadata(
                 function_tool=func_tool,
                 context=tool_context,
@@ -1875,9 +1996,26 @@ class _FunctionToolBatchExecutor:
             )
             real_result = invocation_result.output
             bypass_output_schema = invocation_result.is_sdk_generated_error
+            is_error = invocation_result.is_sdk_generated_error
+        except Exception as invocation_error:
+            if agent_hooks_invocation is None:
+                await record_terminal_error(invocation_error)
+                raise
+            error_type_name = type.__getattribute__(type(invocation_error), "__name__")
+            sanitized_error = sanitize_agent_hooks_application_error(invocation_error)
+            clear_agent_hooks_error_graph(invocation_error)
+            await record_terminal_error(sanitized_error, error_type_name=error_type_name)
+            raise sanitized_error from None
         except asyncio.CancelledError as e:
             if outer_task in self.teardown_cancelled_tasks:
-                raise
+                if agent_hooks_invocation is None:
+                    await record_terminal_error(e)
+                    raise
+                error_type_name = type.__getattribute__(type(e), "__name__")
+                sanitized_error = sanitize_agent_hooks_application_error(e)
+                clear_agent_hooks_error_graph(e)
+                await record_terminal_error(sanitized_error, error_type_name=error_type_name)
+                raise sanitized_error from None
 
             result = await maybe_invoke_function_tool_failure_error_function(
                 function_tool=func_tool,
@@ -1885,7 +2023,14 @@ class _FunctionToolBatchExecutor:
                 error=e,
             )
             if result is None:
-                raise
+                if agent_hooks_invocation is None:
+                    await record_terminal_error(e)
+                    raise
+                error_type_name = type.__getattribute__(type(e), "__name__")
+                sanitized_error = sanitize_agent_hooks_application_error(e)
+                clear_agent_hooks_error_graph(e)
+                await record_terminal_error(sanitized_error, error_type_name=error_type_name)
+                raise sanitized_error from None
 
             bypass_output_schema = _consume_function_tool_default_failure(
                 tool_context
@@ -1902,15 +2047,46 @@ class _FunctionToolBatchExecutor:
                 )
             )
             real_result = result
+            is_error = True
+        except BaseException as invocation_error:
+            if agent_hooks_invocation is None:
+                await record_terminal_error(invocation_error)
+                raise
+            error_type_name = type.__getattribute__(type(invocation_error), "__name__")
+            sanitized_error = sanitize_agent_hooks_application_error(invocation_error)
+            clear_agent_hooks_error_graph(invocation_error)
+            await record_terminal_error(sanitized_error, error_type_name=error_type_name)
+            raise sanitized_error from None
 
         task_state.in_post_invoke_phase = True
 
-        output_guardrail_result = await _execute_tool_output_guardrails(
-            func_tool=func_tool,
-            tool_context=tool_context,
-            agent=self.public_agent,
-            real_result=real_result,
-            tool_output_guardrail_results=self.tool_output_guardrail_results,
+        if agent_hooks_session is not None and agent_hooks_invocation is not None:
+            assert invocation_started_at is not None
+            post_decision = await agent_hooks_session.emit_post_tool(
+                invocation=agent_hooks_invocation,
+                result=real_result,
+                is_error=is_error,
+                started_at=invocation_started_at,
+            )
+            if post_decision.blocked_message is not None:
+                return self._agent_hooks_blocked_result(
+                    func_tool=func_tool,
+                    tool_call=tool_call,
+                    blocked_message=post_decision.blocked_message,
+                )
+            assert post_decision.result is not None
+            real_result = post_decision.result
+
+        output_guardrail_result = (
+            _ToolOutputGuardrailExecutionResult(real_result)
+            if agent_hooks_invocation is not None
+            else await _execute_tool_output_guardrails(
+                func_tool=func_tool,
+                tool_context=tool_context,
+                agent=self.public_agent,
+                real_result=real_result,
+                tool_output_guardrail_results=self.tool_output_guardrail_results,
+            )
         )
         final_result = output_guardrail_result.output
         bypass_output_schema = bypass_output_schema or (output_guardrail_result.is_rejection)
@@ -1920,7 +2096,9 @@ class _FunctionToolBatchExecutor:
             function_tool_error_output(
                 tool_call,
                 final_result,
-                output_json_schema=func_tool.output_json_schema,
+                output_json_schema=(
+                    None if agent_hooks_invocation is not None else func_tool.output_json_schema
+                ),
             )
             if bypass_output_schema
             else final_result
@@ -1928,30 +2106,52 @@ class _FunctionToolBatchExecutor:
         raw_output_item = ItemHelpers.tool_call_output_item(
             tool_call,
             provider_result,
-            output_json_schema=None if bypass_output_schema else func_tool.output_json_schema,
-            output_type_adapter=None if bypass_output_schema else func_tool._output_type_adapter,
-        )
-        extracted_custom_data = await maybe_extract_custom_data(
-            func_tool.custom_data_extractor,
-            FunctionToolCustomDataContext(
-                tool_context=tool_context,
-                tool=func_tool,
-                output=final_result,
-                raw_item=copy.deepcopy(raw_output_item),
+            output_json_schema=(
+                None
+                if bypass_output_schema or agent_hooks_invocation is not None
+                else func_tool.output_json_schema
+            ),
+            output_type_adapter=(
+                None
+                if bypass_output_schema or agent_hooks_invocation is not None
+                else func_tool._output_type_adapter
             ),
         )
-        custom_data = merge_custom_data(tool_context._custom_data, extracted_custom_data)
+        extracted_custom_data = (
+            None
+            if agent_hooks_invocation is not None
+            else await maybe_extract_custom_data(
+                func_tool.custom_data_extractor,
+                FunctionToolCustomDataContext(
+                    tool_context=tool_context,
+                    tool=func_tool,
+                    output=final_result,
+                    raw_item=copy.deepcopy(raw_output_item),
+                ),
+            )
+        )
+        custom_data = (
+            None
+            if agent_hooks_invocation is not None
+            else merge_custom_data(tool_context._custom_data, extracted_custom_data)
+        )
         if custom_data:
             self.custom_data_by_tool_run[id(task_state.tool_run)] = custom_data
 
-        await asyncio.gather(
-            self.hooks.on_tool_end(tool_context, self.public_agent, func_tool, final_result),
-            (
-                agent_hooks.on_tool_end(tool_context, self.public_agent, func_tool, final_result)
-                if agent_hooks
-                else _coro.noop_coroutine()
-            ),
-        )
+        if agent_hooks_invocation is None:
+            await asyncio.gather(
+                self.hooks.on_tool_end(tool_context, self.public_agent, func_tool, final_result),
+                (
+                    agent_hooks.on_tool_end(
+                        tool_context,
+                        self.public_agent,
+                        func_tool,
+                        final_result,
+                    )
+                    if agent_hooks
+                    else _coro.noop_coroutine()
+                ),
+            )
         return final_result
 
     async def _await_invoke_task(

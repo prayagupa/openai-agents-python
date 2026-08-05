@@ -34,6 +34,7 @@ Homepage = "https://openai.github.io/openai-agents-python/"
 Repository = "https://github.com/openai/openai-agents-python"
 
 [project.optional-dependencies]
+agent-hooks = ["agent-hooks-sdk==0.1.0a4", "jsonschema>=4.25.0,<5"]
 voice = ["numpy>=2.2.0, <3; python_version>='3.10'", "websockets>=15.0, <17"]
 viz = ["graphviz>=0.17"]
 litellm = ["litellm>=1.83.0"]
@@ -91,6 +92,7 @@ dev = [
   "testcontainers==4.12.0",       # pinned to 4.12.0 because 4.13.0 has a warning bug in wait_for_logs, see https://github.com/testcontainers/testcontainers-python/issues/874
   "pyright==1.1.408",
   "pymongo>=4.14",
+  "types-jsonschema",
 ]
 
 [tool.uv.workspace]
@@ -220,6 +222,7 @@ filterwarnings = [
 ]
 markers = [
   "allow_call_model_methods: mark test as allowing calls to real model implementations",
+  "e2e: mark test as requiring a local external test service",
   "serial: mark test as requiring serial execution",
 ]
 
@@ -228,10 +231,10 @@ format-command = "ruff format --stdin-filename {filename}"
 
 [tool.uv]
 exclude-newer = "7 days"
-exclude-newer-package = { openai = false }
+exclude-newer-package = { openai = false, agent-hooks-sdk = false }
 index-strategy = "first-index"
 
 [tool.uv.pip]
 exclude-newer = "7 days"
-exclude-newer-package = { openai = false }
+exclude-newer-package = { openai = false, agent-hooks-sdk = false }
 index-strategy = "first-index"

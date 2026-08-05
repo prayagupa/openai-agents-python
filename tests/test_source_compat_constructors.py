@@ -133,7 +133,7 @@ def test_run_config_tool_execution_append_preserves_sandbox_position() -> None:
     assert config.tool_execution is tool_execution
 
 
-def test_run_config_tool_not_found_behavior_append_preserves_tool_execution_position() -> None:
+def test_run_config_agent_hooks_append_preserves_tool_not_found_behavior_position() -> None:
     session_settings = SessionSettings(limit=123)
     tool_execution = ToolExecutionConfig(max_function_tool_concurrency=2)
     config = RunConfig(
@@ -160,6 +160,7 @@ def test_run_config_tool_not_found_behavior_append_preserves_tool_execution_posi
         None,
         tool_execution,
         "return_error_to_model",
+        None,
     )
 
     assert config.session_settings == session_settings
@@ -167,6 +168,7 @@ def test_run_config_tool_not_found_behavior_append_preserves_tool_execution_posi
     assert config.sandbox is None
     assert config.tool_execution is tool_execution
     assert config.tool_not_found_behavior == "return_error_to_model"
+    assert config.agent_hooks is None
 
 
 def test_tool_execution_config_pre_approval_append_preserves_max_concurrency() -> None:

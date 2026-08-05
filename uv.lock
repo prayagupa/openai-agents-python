@@ -14,6 +14,21 @@ exclude-newer-span = "P7D"
 
 [options.exclude-newer-package]
 openai = false
+agent-hooks-sdk = false
+
+[[package]]
+name = "agent-hooks-sdk"
+version = "0.1.0a4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c4/9b/07e9e54941ce60991ce8ba00fe9dc38ea96d885b38a86cd944a409cd7772/agent_hooks_sdk-0.1.0a4.tar.gz", hash = "sha256:e3affd44d7779b8254fd5142f7d41648e48d3d4646acc94b07a28d13c5c07b1d", size = 173745, upload-time = "2026-07-30T02:11:22.235Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b2/f8/5d27dd5a784c7037cbdd23f8ae7982354440a333e9433b19ea02bf8a0ca3/agent_hooks_sdk-0.1.0a4-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:793cf357413546ddc74c62dac10bf62c05a0ffe69009871fd3484105995a13b7", size = 599140, upload-time = "2026-08-05T05:06:39.637Z" },
+    { url = "https://files.pythonhosted.org/packages/0b/82/2f1d273fc4abd882b8a82c0c65574a0bf56c7181bc1a6be52b2bd58d880b/agent_hooks_sdk-0.1.0a4-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:7299cfd93ed455f0bcbfafb759040500e2920c6547fb6d8829f792307d58a6d4", size = 570698, upload-time = "2026-08-05T05:06:40.906Z" },
+    { url = "https://files.pythonhosted.org/packages/6f/4c/26c71782f12e691958dcb59d530c5a17e8efe4651af3085c52db578e56f9/agent_hooks_sdk-0.1.0a4-cp310-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:fa51c408f29fa907be33e8a542f1025b2a92ccce0ccad0a362c299b6cb6dfdd4", size = 626367, upload-time = "2026-08-05T05:06:42.221Z" },
+    { url = "https://files.pythonhosted.org/packages/a8/93/bce858a4e83480373eb55e2923657126e0e736b152f814fcf035b293e3e6/agent_hooks_sdk-0.1.0a4-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:ed556c2d020fffe371eda8055950f7b42c22eee16f3c3ef1dcf1f4ba5704320e", size = 649044, upload-time = "2026-08-05T05:06:43.492Z" },
+    { url = "https://files.pythonhosted.org/packages/d6/07/dc7f4e7a53c208ba35fcf0bd0208cf77a1e84ffd7a42d2a61c6e9faf274b/agent_hooks_sdk-0.1.0a4-cp310-abi3-manylinux_2_34_x86_64.whl", hash = "sha256:86f5ff8e0c1201a61b113026c688fc98ea590b10f8bbc5ccfa6ac289fdec037d", size = 634247, upload-time = "2026-07-30T02:11:20.497Z" },
+    { url = "https://files.pythonhosted.org/packages/34/2f/35caaffec73e0e60829a2ec255da1bfc7fe9564876b97eaa4a063327fd93/agent_hooks_sdk-0.1.0a4-cp310-abi3-win_amd64.whl", hash = "sha256:5e1cd64e3ef9c7447cb56a615f79747b7aa42a0065c8a2c5f0b2ae7f0447c908", size = 479900, upload-time = "2026-08-05T05:06:44.898Z" },
+]
 
 [[package]]
 name = "aiofiles"
@@ -2450,6 +2465,10 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+agent-hooks = [
+    { name = "agent-hooks-sdk" },
+    { name = "jsonschema" },
+]
 any-llm = [
     { name = "any-llm-sdk", marker = "python_full_version >= '3.11'" },
 ]
@@ -2548,12 +2567,14 @@ dev = [
     { name = "sounddevice" },
     { name = "testcontainers" },
     { name = "textual" },
+    { name = "types-jsonschema" },
     { name = "types-pynput" },
     { name = "websockets" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "agent-hooks-sdk", marker = "extra == 'agent-hooks'", specifier = "==0.1.0a4" },
     { name = "aiohttp", marker = "extra == 'blaxel'", specifier = ">=3.12,<4" },
     { name = "aiohttp", marker = "extra == 'cloudflare'", specifier = ">=3.12,<4" },
     { name = "any-llm-sdk", marker = "python_full_version >= '3.11' and extra == 'any-llm'", specifier = ">=1.11.0,<2" },
@@ -2569,6 +2590,7 @@ requires-dist = [
     { name = "graphviz", marker = "extra == 'viz'", specifier = ">=0.17" },
     { name = "griffelib", specifier = ">=2,<3" },
     { name = "grpcio", marker = "extra == 'dapr'", specifier = ">=1.60.0" },
+    { name = "jsonschema", marker = "extra == 'agent-hooks'", specifier = ">=4.25.0,<5" },
     { name = "litellm", marker = "extra == 'litellm'", specifier = ">=1.83.0" },
     { name = "mcp", marker = "python_full_version >= '3.10'", specifier = ">=1.19.0,<2" },
     { name = "modal", marker = "extra == 'modal'", specifier = "==1.4.3" },
@@ -2588,7 +2610,7 @@ requires-dist = [
     { name = "websockets", marker = "extra == 'realtime'", specifier = ">=15.0,<17" },
     { name = "websockets", marker = "extra == 'voice'", specifier = ">=15.0,<17" },
 ]
-provides-extras = ["voice", "viz", "litellm", "any-llm", "realtime", "sqlalchemy", "encrypt", "redis", "dapr", "mongodb", "docker", "blaxel", "daytona", "cloudflare", "e2b", "modal", "runloop", "vercel", "s3", "temporal"]
+provides-extras = ["agent-hooks", "voice", "viz", "litellm", "any-llm", "realtime", "sqlalchemy", "encrypt", "redis", "dapr", "mongodb", "docker", "blaxel", "daytona", "cloudflare", "e2b", "modal", "runloop", "vercel", "s3", "temporal"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -2621,6 +2643,7 @@ dev = [
     { name = "sounddevice" },
     { name = "testcontainers", specifier = "==4.12.0" },
     { name = "textual" },
+    { name = "types-jsonschema" },
     { name = "types-pynput" },
     { name = "websockets" },
 ]
@@ -4147,6 +4170,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/52/68/943c3aeaf14624712a0357c4a67814dba5cea36d194f5c764dad7959a00c/types-certifi-2021.10.8.3.tar.gz", hash = "sha256:72cf7798d165bc0b76e1c10dd1ea3097c7063c42c21d664523b928e88b554a4f", size = 2095, upload-time = "2022-06-09T15:19:05.244Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b5/63/2463d89481e811f007b0e1cd0a91e52e141b47f9de724d20db7b861dcfec/types_certifi-2021.10.8.3-py3-none-any.whl", hash = "sha256:b2d1e325e69f71f7c78e5943d410e650b4707bb0ef32e4ddf3da37f54176e88a", size = 2136, upload-time = "2022-06-09T15:19:03.127Z" },
+]
+
+[[package]]
+name = "types-jsonschema"
+version = "4.26.0.20260518"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "referencing" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/dd/46/73b6a5d61a61015c4248030a8cb07e5bdddb4041430fae9e585a68692578/types_jsonschema-4.26.0.20260518.tar.gz", hash = "sha256:e1dd53dc97a64f5eccdd6fa9839666e09bb500a8ebba2db6fdaf1789faea81a6", size = 16638, upload-time = "2026-05-18T06:06:44.106Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/07/d5/134f8a147dcecda10db7f60cfc6af0578a25a5c53c87b3907a64385e0184/types_jsonschema-4.26.0.20260518-py3-none-any.whl", hash = "sha256:30b30a518c7fe335df85c919fcbcc631b69c03d4a4b5b632fa916bea03065307", size = 16072, upload-time = "2026-05-18T06:06:43.264Z" },
 ]
 
 [[package]]
